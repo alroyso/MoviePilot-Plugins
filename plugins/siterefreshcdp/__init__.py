@@ -28,7 +28,7 @@ class SiteRefreshCDP(_PluginBase):
     # 插件图标
     plugin_icon = "Chrome_A.png"
     # 插件版本
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     # 插件作者
     plugin_author = "al"
     # 作者主页
@@ -260,8 +260,9 @@ class SiteRefreshCDP(_PluginBase):
 
             logger.info(f"开始站点签到：{site_name}，地址：{checkin_url}")
             page.goto(checkin_url)
-            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_load_state("load")
             html = page.content()
+            logger.info(f"站点{site_name}签到页已打开：{page.url}，标题：{page.title()}")
 
             # Cookie已失效时现场登录，省去等下次触发
             if not SiteUtils.is_logged_in(html):
@@ -275,7 +276,7 @@ class SiteRefreshCDP(_PluginBase):
                 if self.__save_cookie(context=context, page=page, site=site):
                     record["cookie"] = "已更新"
                 page.goto(checkin_url)
-                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_load_state("load")
                 html = page.content()
                 if not SiteUtils.is_logged_in(html):
                     record["status"] = "签到失败，登录后仍未通过"
@@ -315,7 +316,9 @@ class SiteRefreshCDP(_PluginBase):
         login_url = urljoin(site.url, "login.php")
         try:
             page.goto(login_url)
-            page.wait_for_load_state("domcontentloaded")
+            # 等到load而非domcontentloaded，否则验证码图片可能还没下载完
+            page.wait_for_load_state("load")
+            logger.info(f"站点{site.name}登录页已打开：{page.url}，标题：{page.title()}")
         except Exception as e:
             logger.error(f"站点{site.name}打开登录页失败：{e}")
             return False
@@ -372,24 +375,44 @@ class SiteRefreshCDP(_PluginBase):
                     if box.count() and box.is_checked():
                         box.uncheck()
 
-                page.click('input[type="submit"]')
-                page.wait_for_load_state("domcontentloaded")
+                # 精确点登录按钮，避免页面上其它表单的提交按钮
+                submit = page.locator('form input[type="submit"]').first
+                if not submit.count():
+                    submit = page.locator('input[type="submit"]').first
+                submit.click()
+                page.wait_for_load_state("load")
                 time.sleep(2)
 
                 if SiteUtils.is_logged_in(page.content()):
                     logger.info(f"站点{site_name}登录成功")
                     return True
 
+                # 把站点返回的失败原因打出来，否则只能瞎猜
+                logger.warn(f"站点{site_name}登录未通过，当前地址：{page.url}，"
+                            f"页面提示：{self.__page_hint(page)}")
+
                 if i < retry - 1:
-                    logger.warn(f"站点{site_name}登录未通过，第{i + 2}次重试")
+                    logger.warn(f"站点{site_name}第{i + 2}次重试")
                     page.goto(urljoin(page.url, "login.php"))
-                    page.wait_for_load_state("domcontentloaded")
+                    page.wait_for_load_state("load")
             except Exception as e:
                 logger.error(f"站点{site_name}填写登录表单失败：{e}")
                 return False
 
         logger.error(f"站点{site_name}登录失败，已重试{retry}次")
         return False
+
+    @staticmethod
+    def __page_hint(page, limit: int = 150) -> str:
+        """
+        提取页面正文摘要，用于定位登录失败原因
+        """
+        try:
+            text = page.evaluate("() => document.body ? document.body.innerText : ''")
+            text = re.sub(r'\s+', ' ', str(text or "")).strip()
+            return text[:limit] if text else "(页面无正文)"
+        except Exception as e:
+            return f"(读取失败：{e})"
 
     def __ocr_captcha(self, page, site_name: str) -> Optional[str]:
         """
@@ -409,13 +432,33 @@ class SiteRefreshCDP(_PluginBase):
             if not img.count():
                 logger.error(f"站点{site_name}未定位到验证码图片")
                 return None
+            img = img.first
 
-            image_bytes = img.first.screenshot()
+            # 图片没真正下载完就截图，只会截到空白，OCR会输出乱码
+            try:
+                img.wait_for(state="visible", timeout=self._timeout * 1000)
+                page.wait_for_function(
+                    "el => el.complete && el.naturalWidth > 0",
+                    arg=img.element_handle(),
+                    timeout=self._timeout * 1000
+                )
+            except Exception as e:
+                logger.error(f"站点{site_name}验证码图片未加载完成：{e}")
+                return None
+
+            box = img.bounding_box()
+            if not box or box.get("width", 0) < 10 or box.get("height", 0) < 10:
+                logger.error(f"站点{site_name}验证码图片尺寸异常：{box}")
+                return None
+
+            image_bytes = img.screenshot()
             code = ddddocr.DdddOcr(show_ad=False).classification(image_bytes)
+            code = re.sub(r'[^0-9a-zA-Z]', '', str(code or ""))
             if not code:
                 logger.error(f"站点{site_name}验证码识别为空")
                 return None
-            logger.info(f"站点{site_name}验证码识别结果：{code}")
+            logger.info(f"站点{site_name}验证码识别结果：{code}"
+                        f"（图片{int(box.get('width'))}x{int(box.get('height'))}）")
             return code
         except Exception as e:
             logger.error(f"站点{site_name}验证码识别失败：{e}")
