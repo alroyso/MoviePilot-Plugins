@@ -28,7 +28,7 @@ class SiteRefreshCDP(_PluginBase):
     # 插件图标
     plugin_icon = "Chrome_A.png"
     # 插件版本
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     # 插件作者
     plugin_author = "al"
     # 作者主页
@@ -170,14 +170,17 @@ class SiteRefreshCDP(_PluginBase):
         if not self._cdp_url:
             logger.error("未配置CDP地址，无法执行")
             return
-        if not self._sign_sites:
-            logger.warn("未选择签到站点")
-            return
 
-        sites = [site for site in self.siteoper.list_order_by_pri()
-                 if site.id in self._sign_sites]
+        all_sites = self.siteoper.list_order_by_pri()
+        if self._sign_sites:
+            sites = [site for site in all_sites if site.id in self._sign_sites]
+        else:
+            # 未勾选站点时，把配了登录凭据的站点当作目标，避免配好凭据却不执行
+            sites = [site for site in all_sites if self.__get_site_conf(site)[0]]
+            if sites:
+                logger.info(f"未选择签到站点，按登录凭据自动选中 {len(sites)} 个站点")
         if not sites:
-            logger.warn("选中的站点均不存在")
+            logger.warn("没有可处理的站点：请勾选签到站点，或在登录凭据中配置站点")
             return
 
         try:
@@ -687,7 +690,7 @@ class SiteRefreshCDP(_PluginBase):
                                             'chips': True,
                                             'multiple': True,
                                             'model': 'sign_sites',
-                                            'label': '签到站点',
+                                            'label': '签到站点（留空则按下方登录凭据自动选择）',
                                             'items': site_options
                                         }
                                     }
@@ -762,7 +765,8 @@ class SiteRefreshCDP(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '按周期访问签到页，Cookie失效时自动登录并回写Cookie和UA，无需依赖【站点自动签到】插件。'
+                                            'text': '执行流程：打开签到页 → 检测登录态 → 未登录则自动登录并回写Cookie和UA → 完成签到。'
+                                                    '签到站点留空时，自动处理下方配置了登录凭据的站点。'
                                                     '仅适配NexusPHP标准签到与登录表单，验证码由ddddocr识别，不保证成功率。'
                                                     '未配置登录凭据的站点，Cookie失效时只会记录失败。'
                                         }
