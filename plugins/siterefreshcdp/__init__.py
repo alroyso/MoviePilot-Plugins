@@ -28,7 +28,7 @@ class SiteRefreshCDP(_PluginBase):
     # 插件图标
     plugin_icon = "Chrome_A.png"
     # 插件版本
-    plugin_version = "1.4"
+    plugin_version = "1.6"
     # 插件作者
     plugin_author = "al"
     # 作者主页
@@ -192,32 +192,25 @@ class SiteRefreshCDP(_PluginBase):
         logger.info(f"开始站点签到，共 {len(sites)} 个站点")
         results = []
         browser = None
-        context = None
-        own_context = False
         try:
             with sync_playwright() as p:
                 logger.info(f"连接CDP浏览器 {self._cdp_url}")
                 browser = p.chromium.connect_over_cdp(self._cdp_url,
                                                       timeout=self._timeout * 1000)
-                # 复用外部浏览器已有上下文，能带上它的真实指纹和登录态
-                if browser.contexts:
-                    context = browser.contexts[0]
-                else:
-                    context = browser.new_context()
-                    own_context = True
+                logger.info(f"CDP浏览器已连接，共 {len(browser.contexts)} 个上下文，"
+                            f"{sum(len(c.pages) for c in browser.contexts)} 个标签页")
 
                 for site in sites:
-                    results.append(self.__signin_site(context=context, site=site))
+                    results.append(self.__signin_site(browser=browser, site=site))
         except Exception as e:
             logger.error(f"CDP连接异常：{e}")
             return
         finally:
-            for closer in (context if own_context else None, browser):
-                try:
-                    if closer:
-                        closer.close()
-                except Exception:
-                    pass
+            try:
+                if browser:
+                    browser.close()
+            except Exception:
+                pass
 
         # 汇总
         logger.info("站点签到任务完成")
@@ -241,7 +234,41 @@ class SiteRefreshCDP(_PluginBase):
         except Exception as e:
             logger.error(f"保存签到记录失败：{e}")
 
-    def __signin_site(self, context, site) -> dict:
+    # NexusPHP登录态Cookie，命中其一即视为该上下文已登录
+    LOGIN_COOKIES = ("c_secure_uid", "c_secure_pass", "uid", "pass")
+
+    def __pick_context(self, browser, site) -> Tuple[Any, bool]:
+        """
+        挑选持有该站点登录态的浏览器上下文，优先复用外部浏览器已有的会话
+        :return: (context, 是否为本次新建)
+        """
+        domain = StringUtils.get_url_domain(site.url)
+        fallback = None
+        for index, ctx in enumerate(browser.contexts):
+            try:
+                names = {c.get("name") for c in ctx.cookies()
+                         if domain in str(c.get("domain") or "")}
+            except Exception:
+                continue
+            if not names:
+                continue
+            # 有登录态Cookie的上下文最理想，可以完全跳过登录
+            if names & set(self.LOGIN_COOKIES):
+                logger.info(f"站点{site.name}命中上下文#{index}的登录态Cookie，直接复用会话")
+                return ctx, False
+            if fallback is None:
+                fallback = (index, ctx)
+
+        if fallback:
+            logger.info(f"站点{site.name}在上下文#{fallback[0]}找到该域Cookie但无登录态，复用该上下文")
+            return fallback[1], False
+        if browser.contexts:
+            logger.warn(f"站点{site.name}在所有上下文中都没有该域Cookie，使用上下文#0")
+            return browser.contexts[0], False
+        logger.warn(f"站点{site.name}：CDP浏览器无可用上下文，新建一个（不含任何登录态）")
+        return browser.new_context(), True
+
+    def __signin_site(self, browser, site) -> dict:
         """
         单站点签到，未登录时先登录再重试
         :return: {date, site, status, login, cookie}
@@ -257,6 +284,7 @@ class SiteRefreshCDP(_PluginBase):
             "cookie": "未更新"
         }
         page = None
+        context, own_context = self.__pick_context(browser=browser, site=site)
         try:
             page = context.new_page()
             page.set_default_timeout(self._timeout * 1000)
@@ -268,7 +296,7 @@ class SiteRefreshCDP(_PluginBase):
             logger.info(f"站点{site_name}签到页已打开：{page.url}，标题：{page.title()}")
 
             # Cookie已失效时现场登录，省去等下次触发
-            if not SiteUtils.is_logged_in(html):
+            if not self.__is_logged_in(page):
                 logger.warn(f"站点{site_name}未登录，尝试自动登录")
                 if not self.__login(page=page, site=site):
                     record["login"] = "失败"
@@ -281,7 +309,7 @@ class SiteRefreshCDP(_PluginBase):
                 page.goto(checkin_url)
                 page.wait_for_load_state("load")
                 html = page.content()
-                if not SiteUtils.is_logged_in(html):
+                if not self.__is_logged_in(page):
                     record["status"] = "签到失败，登录后仍未通过"
                     return record
             else:
@@ -301,11 +329,13 @@ class SiteRefreshCDP(_PluginBase):
             record["status"] = f"签到失败：{e}"
             return record
         finally:
-            try:
-                if page:
-                    page.close()
-            except Exception:
-                pass
+            # 只清理自己创建的资源，不动用户浏览器里已有的标签页
+            for closer in (page, context if own_context else None):
+                try:
+                    if closer:
+                        closer.close()
+                except Exception:
+                    pass
 
     def __login(self, page, site) -> bool:
         """
@@ -386,7 +416,7 @@ class SiteRefreshCDP(_PluginBase):
                 page.wait_for_load_state("load")
                 time.sleep(2)
 
-                if SiteUtils.is_logged_in(page.content()):
+                if self.__is_logged_in(page):
                     logger.info(f"站点{site_name}登录成功")
                     return True
 
@@ -404,6 +434,30 @@ class SiteRefreshCDP(_PluginBase):
 
         logger.error(f"站点{site_name}登录失败，已重试{retry}次")
         return False
+
+    @staticmethod
+    def __is_logged_in(page) -> bool:
+        """
+        判断当前页面是否处于登录态
+
+        判断顺序：先看URL有没有被站点踢回登录页，再找登录后才会出现的入口，
+        最后才回退到主程序的HTML特征判断。
+        """
+        try:
+            # 站点把请求重定向到登录页，是最确凿的未登录信号
+            if re.search(r'/(login|takelogin)\.php', page.url, re.IGNORECASE):
+                return False
+            # 登录后才会出现的入口，命中任意一个即可
+            for selector in ('a[href*="logout.php"]',
+                             'a[href*="usercp.php"]',
+                             'a[href*="userdetails.php?id="]'):
+                if page.locator(selector).count():
+                    return True
+            # 兜底用主程序的判断，兼容非标准模板
+            return bool(SiteUtils.is_logged_in(page.content()))
+        except Exception as e:
+            logger.error(f"登录状态判断失败：{e}")
+            return False
 
     @staticmethod
     def __page_hint(page, limit: int = 150) -> str:
@@ -473,16 +527,30 @@ class SiteRefreshCDP(_PluginBase):
         """
         try:
             domain = StringUtils.get_url_domain(site.url)
-            items = [f"{c.get('name')}={c.get('value')}"
-                     for c in context.cookies()
-                     if domain in str(c.get("domain") or "")]
-            if not items:
+            cookies = [c for c in context.cookies()
+                       if domain in str(c.get("domain") or "")]
+            if not cookies:
                 logger.warn(f"站点{site.name}未提取到Cookie")
                 return False
-            cookie = "; ".join(items)
+
+            names = [str(c.get("name")) for c in cookies]
+            # 缺登录态Cookie说明这份会话是匿名的，写回去只会污染站点配置
+            if not set(names) & set(self.LOGIN_COOKIES):
+                logger.warn(f"站点{site.name}的Cookie中没有登录态字段，放弃回写。"
+                            f"当前字段：{names}")
+                return False
+
+            cookie = "; ".join([f"{c.get('name')}={c.get('value')}" for c in cookies])
+            # UA必须取浏览器自报的值：cf_clearance与UA绑定，拼一个假的会让它立即失效
             ua = page.evaluate("() => navigator.userAgent")
             self.siteoper.update(site.id, {"cookie": cookie, "ua": ua})
-            logger.info(f"站点{site.name}的Cookie和UA已更新")
+
+            if "cf_clearance" in names:
+                logger.info(f"站点{site.name}的Cookie和UA已更新（含cf_clearance，"
+                            f"共{len(names)}项）")
+            else:
+                logger.info(f"站点{site.name}的Cookie和UA已更新（共{len(names)}项，"
+                            f"无cf_clearance，若站点启用Cloudflare可能仍会被拦）")
             return True
         except Exception as e:
             logger.error(f"站点{site.name}回写Cookie失败：{e}")
@@ -553,13 +621,16 @@ class SiteRefreshCDP(_PluginBase):
             with sync_playwright() as p:
                 browser = p.chromium.connect_over_cdp(self._cdp_url,
                                                       timeout=self._timeout * 1000)
-                if browser.contexts:
-                    context = browser.contexts[0]
-                else:
-                    context = browser.new_context()
-                    own_context = True
+                context, own_context = self.__pick_context(browser=browser, site=site)
                 page = context.new_page()
                 page.set_default_timeout(self._timeout * 1000)
+
+                # 浏览器里已有登录态时直接取Cookie，不必再走一遍表单
+                page.goto(site.url)
+                page.wait_for_load_state("load")
+                if self.__is_logged_in(page):
+                    logger.info(f"站点{site.name}已是登录状态，直接提取Cookie")
+                    return self.__save_cookie(context=context, page=page, site=site)
 
                 if not self.__login(page=page, site=site):
                     return False
