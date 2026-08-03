@@ -28,7 +28,7 @@ class SiteRefreshCDP(_PluginBase):
     # 插件图标
     plugin_icon = "Chrome_A.png"
     # 插件版本
-    plugin_version = "1.6"
+    plugin_version = "1.7"
     # 插件作者
     plugin_author = "al"
     # 作者主页
@@ -366,7 +366,7 @@ class SiteRefreshCDP(_PluginBase):
         """
         从配置中匹配出站点的登录凭据
         """
-        for site_conf in self._siteconf:
+        for index, site_conf in enumerate(self._siteconf):
             if not site_conf:
                 continue
             site_confs = str(site_conf).split("|")
@@ -374,7 +374,8 @@ class SiteRefreshCDP(_PluginBase):
                 siteurl, siteuser, sitepwd, *sitecode = site_confs
                 sitecode = str(sitecode[0]) if sitecode else ""
             except Exception as e:
-                logger.error(f"{site_conf}配置有误:{e}，已跳过")
+                # 只报行号，整行打出来会把密码写进日志
+                logger.error(f"登录凭据第{index + 1}行配置有误:{e}，已跳过")
                 continue
             if str(siteurl) in StringUtils.get_url_domain(site.url):
                 return siteuser, sitepwd, sitecode
