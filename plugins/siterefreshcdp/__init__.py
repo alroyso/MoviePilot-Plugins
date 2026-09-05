@@ -28,7 +28,7 @@ class SiteRefreshCDP(_PluginBase):
     # 插件图标
     plugin_icon = "Chrome_A.png"
     # 插件版本
-    plugin_version = "1.7"
+    plugin_version = "1.8"
     # 插件作者
     plugin_author = "al"
     # 作者主页
@@ -290,8 +290,10 @@ class SiteRefreshCDP(_PluginBase):
             page.set_default_timeout(self._timeout * 1000)
 
             logger.info(f"开始站点签到：{site_name}，地址：{checkin_url}")
-            page.goto(checkin_url)
-            page.wait_for_load_state("load")
+            # 人机验证页没有任何登录入口，不先过掉会被误判成未登录而去走登录流程
+            if not self.__open(page=page, url=checkin_url, site_name=site_name):
+                record["status"] = "签到失败，人机验证未通过"
+                return record
             html = page.content()
             logger.info(f"站点{site_name}签到页已打开：{page.url}，标题：{page.title()}")
 
@@ -306,8 +308,9 @@ class SiteRefreshCDP(_PluginBase):
                 # 登录成功顺带回写Cookie和UA
                 if self.__save_cookie(context=context, page=page, site=site):
                     record["cookie"] = "已更新"
-                page.goto(checkin_url)
-                page.wait_for_load_state("load")
+                if not self.__open(page=page, url=checkin_url, site_name=site_name):
+                    record["status"] = "签到失败，登录后人机验证未通过"
+                    return record
                 html = page.content()
                 if not self.__is_logged_in(page):
                     record["status"] = "签到失败，登录后仍未通过"
@@ -348,9 +351,8 @@ class SiteRefreshCDP(_PluginBase):
 
         login_url = urljoin(site.url, "login.php")
         try:
-            page.goto(login_url)
-            # 等到load而非domcontentloaded，否则验证码图片可能还没下载完
-            page.wait_for_load_state("load")
+            if not self.__open(page=page, url=login_url, site_name=site.name):
+                return False
             logger.info(f"站点{site.name}登录页已打开：{page.url}，标题：{page.title()}")
         except Exception as e:
             logger.error(f"站点{site.name}打开登录页失败：{e}")
@@ -416,6 +418,8 @@ class SiteRefreshCDP(_PluginBase):
                 submit.click()
                 page.wait_for_load_state("load")
                 time.sleep(2)
+                # 提交后落地页同样可能被拦，先过验证再判断登录结果
+                self.__pass_challenge(page=page, site_name=site_name)
 
                 if self.__is_logged_in(page):
                     logger.info(f"站点{site_name}登录成功")
@@ -427,14 +431,109 @@ class SiteRefreshCDP(_PluginBase):
 
                 if i < retry - 1:
                     logger.warn(f"站点{site_name}第{i + 2}次重试")
-                    page.goto(urljoin(page.url, "login.php"))
-                    page.wait_for_load_state("load")
+                    if not self.__open(page=page, url=urljoin(page.url, "login.php"),
+                                       site_name=site_name):
+                        return False
             except Exception as e:
                 logger.error(f"站点{site_name}填写登录表单失败：{e}")
                 return False
 
         logger.error(f"站点{site_name}登录失败，已重试{retry}次")
         return False
+
+    def __open(self, page, url: str, site_name: str) -> bool:
+        """
+        打开页面并等待加载完成，遇到Cloudflare人机验证时原地等待/刷新直到通过
+        :return: 页面是否已是正常内容（非验证页）
+        """
+        page.goto(url)
+        # 等到load而非domcontentloaded，否则验证码图片可能还没下载完
+        page.wait_for_load_state("load")
+        return self.__pass_challenge(page=page, site_name=site_name)
+
+    def __pass_challenge(self, page, site_name: str) -> bool:
+        """
+        等待Cloudflare人机验证通过
+
+        验证组件在真实浏览器里通常几秒内自行完成并跳转；没跳转就点一下复选框，
+        再不行就刷新页面重试。全程复用同一个标签页，关掉重开只会让验证重新来过。
+        """
+        if not self.__is_challenge(page):
+            return True
+        logger.info(f"站点{site_name}遇到人机验证页，等待浏览器自动通过")
+        deadline = time.time() + self._timeout
+        round_no = 0
+        while time.time() < deadline:
+            round_no += 1
+            if self.__wait_challenge_gone(page, seconds=5):
+                break
+            # 交互式验证需要点一下复选框，自动式验证点了也无害
+            if self.__click_challenge_box(page):
+                if self.__wait_challenge_gone(page, seconds=5):
+                    break
+            logger.info(f"站点{site_name}人机验证第{round_no}轮未通过，刷新页面重试")
+            try:
+                page.reload()
+                page.wait_for_load_state("load")
+            except Exception as e:
+                # 验证通过瞬间会自行跳转，此时reload被打断是正常现象
+                logger.debug(f"站点{site_name}刷新验证页被打断：{e}")
+        else:
+            logger.warn(f"站点{site_name}人机验证在{self._timeout}秒内未通过，"
+                        f"当前地址：{page.url}，标题：{page.title()}")
+            return False
+
+        try:
+            page.wait_for_load_state("load")
+        except Exception:
+            pass
+        logger.info(f"站点{site_name}人机验证已通过，共{round_no}轮，当前地址：{page.url}")
+        return True
+
+    def __wait_challenge_gone(self, page, seconds: int) -> bool:
+        """
+        每秒检查一次验证页是否已消失
+        """
+        for _ in range(seconds):
+            page.wait_for_timeout(1000)
+            if not self.__is_challenge(page):
+                return True
+        return False
+
+    @staticmethod
+    def __click_challenge_box(page) -> bool:
+        """
+        尽力点击Turnstile复选框；组件藏在closed shadow DOM里时找不到，返回False
+        """
+        try:
+            frame = page.locator('iframe[src*="challenges.cloudflare.com"]').first
+            if not frame.count():
+                return False
+            box = frame.bounding_box()
+            if not box:
+                return False
+            # 复选框位于组件左侧，垂直居中
+            page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def __is_challenge(page) -> bool:
+        """
+        判断当前是否为Cloudflare人机验证页
+
+        只认验证页独有的特征；challenge-platform脚本在正常页面也会注入，不能作依据。
+        """
+        try:
+            if re.search(r'just a moment|请稍候|稍等片刻', page.title() or "", re.IGNORECASE):
+                return True
+            html = page.content()
+            return bool(re.search(r'_cf_chl_opt|id="challenge-running"|id="challenge-form"'
+                                  r'|challenge-error-text|cf-chl-widget',
+                                  html, re.IGNORECASE))
+        except Exception:
+            return False
 
     @staticmethod
     def __is_logged_in(page) -> bool:
@@ -627,8 +726,8 @@ class SiteRefreshCDP(_PluginBase):
                 page.set_default_timeout(self._timeout * 1000)
 
                 # 浏览器里已有登录态时直接取Cookie，不必再走一遍表单
-                page.goto(site.url)
-                page.wait_for_load_state("load")
+                if not self.__open(page=page, url=site.url, site_name=site.name):
+                    return False
                 if self.__is_logged_in(page):
                     logger.info(f"站点{site.name}已是登录状态，直接提取Cookie")
                     return self.__save_cookie(context=context, page=page, site=site)
