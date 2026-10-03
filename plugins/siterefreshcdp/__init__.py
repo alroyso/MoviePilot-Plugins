@@ -28,7 +28,7 @@ class SiteRefreshCDP(_PluginBase):
     # 插件图标
     plugin_icon = "Chrome_A.png"
     # 插件版本
-    plugin_version = "1.8"
+    plugin_version = "1.9"
     # 插件作者
     plugin_author = "al"
     # 作者主页
@@ -236,6 +236,8 @@ class SiteRefreshCDP(_PluginBase):
 
     # NexusPHP登录态Cookie，命中其一即视为该上下文已登录
     LOGIN_COOKIES = ("c_secure_uid", "c_secure_pass", "uid", "pass")
+    # 标签页被中途关闭时，最多尝试的总次数（含首次）
+    CLOSED_RETRY = 3
 
     def __pick_context(self, browser, site) -> Tuple[Any, bool]:
         """
@@ -283,62 +285,99 @@ class SiteRefreshCDP(_PluginBase):
             "login": "未触发",
             "cookie": "未更新"
         }
-        page = None
         context, own_context = self.__pick_context(browser=browser, site=site)
         try:
-            page = context.new_page()
-            page.set_default_timeout(self._timeout * 1000)
-
-            logger.info(f"开始站点签到：{site_name}，地址：{checkin_url}")
-            # 人机验证页没有任何登录入口，不先过掉会被误判成未登录而去走登录流程
-            if not self.__open(page=page, url=checkin_url, site_name=site_name):
-                record["status"] = "签到失败，人机验证未通过"
-                return record
-            html = page.content()
-            logger.info(f"站点{site_name}签到页已打开：{page.url}，标题：{page.title()}")
-
-            # Cookie已失效时现场登录，省去等下次触发
-            if not self.__is_logged_in(page):
-                logger.warn(f"站点{site_name}未登录，尝试自动登录")
-                if not self.__login(page=page, site=site):
-                    record["login"] = "失败"
-                    record["status"] = "签到失败，登录失败"
+            for attempt in range(1, self.CLOSED_RETRY + 1):
+                page = None
+                try:
+                    # 每轮都新开标签页：上一轮的标签页被关掉后在这里自动补开
+                    page = context.new_page()
+                    page.set_default_timeout(self._timeout * 1000)
+                    return self.__do_signin(page=page, context=context, site=site,
+                                            checkin_url=checkin_url, record=record)
+                except Exception as e:
+                    closed = self.__is_closed_error(e, page)
+                    if closed and attempt < self.CLOSED_RETRY:
+                        logger.warn(f"站点{site_name}标签页被关闭（{e}），"
+                                    f"重新打开标签页继续签到（第{attempt + 1}次）")
+                        # 重试从头来过，丢掉上一轮可能写了一半的状态
+                        record.update({"login": "未触发", "cookie": "未更新"})
+                        continue
+                    logger.error(f"站点{site_name}签到异常：{e}")
+                    record["status"] = f"签到失败：{e}"
                     return record
-                record["login"] = "成功"
-                # 登录成功顺带回写Cookie和UA
-                if self.__save_cookie(context=context, page=page, site=site):
-                    record["cookie"] = "已更新"
-                if not self.__open(page=page, url=checkin_url, site_name=site_name):
-                    record["status"] = "签到失败，登录后人机验证未通过"
-                    return record
-                html = page.content()
-                if not self.__is_logged_in(page):
-                    record["status"] = "签到失败，登录后仍未通过"
-                    return record
-            else:
-                # 登录态正常时也刷新一次Cookie，避免它临近过期
-                if self.__save_cookie(context=context, page=page, site=site):
-                    record["cookie"] = "已更新"
-
-            if re.search(r'已签|签到已得', html, re.IGNORECASE) or SiteUtils.is_checkin(html):
-                logger.info(f"{site_name} 签到成功")
-                record["status"] = "签到成功"
-            else:
-                logger.info(f"{site_name} 已访问签到页")
-                record["status"] = "已访问签到页"
-            return record
-        except Exception as e:
-            logger.error(f"站点{site_name}签到异常：{e}")
-            record["status"] = f"签到失败：{e}"
+                finally:
+                    # 只清理自己创建的标签页，不动用户浏览器里已有的
+                    try:
+                        if page and not page.is_closed():
+                            page.close()
+                    except Exception:
+                        pass
             return record
         finally:
-            # 只清理自己创建的资源，不动用户浏览器里已有的标签页
-            for closer in (page, context if own_context else None):
-                try:
-                    if closer:
-                        closer.close()
-                except Exception:
-                    pass
+            try:
+                if own_context:
+                    context.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def __is_closed_error(error: Exception, page=None) -> bool:
+        """
+        判断异常是否由标签页/上下文被关闭引起
+        """
+        try:
+            if page is not None and page.is_closed():
+                return True
+        except Exception:
+            pass
+        text = f"{type(error).__name__} {error}".lower()
+        return any(key in text for key in ("targetclosed", "target closed", "has been closed",
+                                           "page closed", "context closed"))
+
+    def __do_signin(self, page, context, site, checkin_url: str, record: dict) -> dict:
+        """
+        在已打开的标签页内完成一次签到流程，未登录时先登录再重试
+        """
+        site_name = site.name
+        logger.info(f"开始站点签到：{site_name}，地址：{checkin_url}")
+        # 人机验证页没有任何登录入口，不先过掉会被误判成未登录而去走登录流程
+        if not self.__open(page=page, url=checkin_url, site_name=site_name):
+            record["status"] = "签到失败，人机验证未通过"
+            return record
+        html = page.content()
+        logger.info(f"站点{site_name}签到页已打开：{page.url}，标题：{page.title()}")
+
+        # Cookie已失效时现场登录，省去等下次触发
+        if not self.__is_logged_in(page):
+            logger.warn(f"站点{site_name}未登录，尝试自动登录")
+            if not self.__login(page=page, site=site):
+                record["login"] = "失败"
+                record["status"] = "签到失败，登录失败"
+                return record
+            record["login"] = "成功"
+            # 登录成功顺带回写Cookie和UA
+            if self.__save_cookie(context=context, page=page, site=site):
+                record["cookie"] = "已更新"
+            if not self.__open(page=page, url=checkin_url, site_name=site_name):
+                record["status"] = "签到失败，登录后人机验证未通过"
+                return record
+            html = page.content()
+            if not self.__is_logged_in(page):
+                record["status"] = "签到失败，登录后仍未通过"
+                return record
+        else:
+            # 登录态正常时也刷新一次Cookie，避免它临近过期
+            if self.__save_cookie(context=context, page=page, site=site):
+                record["cookie"] = "已更新"
+
+        if re.search(r'已签|签到已得', html, re.IGNORECASE) or SiteUtils.is_checkin(html):
+            logger.info(f"{site_name} 签到成功")
+            record["status"] = "签到成功"
+        else:
+            logger.info(f"{site_name} 已访问签到页")
+            record["status"] = "已访问签到页"
+        return record
 
     def __login(self, page, site) -> bool:
         """
