@@ -28,7 +28,7 @@ class SiteRefreshCDP(_PluginBase):
     # 插件图标
     plugin_icon = "Chrome_A.png"
     # 插件版本
-    plugin_version = "1.10"
+    plugin_version = "1.11"
     # 插件作者
     plugin_author = "al"
     # 作者主页
@@ -460,7 +460,7 @@ class SiteRefreshCDP(_PluginBase):
                 if not submit.count():
                     submit = page.locator('input[type="submit"]').first
                 submit.click()
-                page.wait_for_load_state("load")
+                self.__wait_load(page)
                 time.sleep(2)
                 # 提交后落地页同样可能被拦，先过验证再判断登录结果
                 self.__pass_challenge(page=page, site_name=site_name)
@@ -491,9 +491,20 @@ class SiteRefreshCDP(_PluginBase):
         :return: 页面是否已是正常内容（非验证页）
         """
         self.__goto(page=page, url=url, site_name=site_name)
-        # 等到load而非domcontentloaded，否则验证码图片可能还没下载完
-        page.wait_for_load_state("load")
+        # DOM就绪即可，load只尽力等一小会儿：个别第三方资源会一直挂着，让load迟迟不触发
+        self.__wait_load(page)
         return self.__pass_challenge(page=page, site_name=site_name)
+
+    def __wait_load(self, page, seconds: int = 15):
+        """
+        尽力等待load事件，超时不报错：页面内容通常早已渲染完，只是有资源还在加载
+        """
+        try:
+            page.wait_for_load_state("load", timeout=seconds * 1000)
+        except Exception as e:
+            if self.__is_closed_error(e, page):
+                raise
+            logger.debug(f"等待页面load超时，按已加载处理：{page.url}")
 
     def __goto(self, page, url: str, site_name: str):
         """
@@ -501,7 +512,7 @@ class SiteRefreshCDP(_PluginBase):
         """
         for attempt in range(1, self.NET_RETRY + 1):
             try:
-                page.goto(url)
+                page.goto(url, wait_until="domcontentloaded")
                 return
             except Exception as e:
                 text = str(e)
@@ -535,7 +546,7 @@ class SiteRefreshCDP(_PluginBase):
             logger.info(f"站点{site_name}人机验证第{round_no}轮未通过，刷新页面重试")
             try:
                 page.reload()
-                page.wait_for_load_state("load")
+                self.__wait_load(page)
             except Exception as e:
                 # 验证通过瞬间会自行跳转，此时reload被打断是正常现象
                 logger.debug(f"站点{site_name}刷新验证页被打断：{e}")
@@ -545,7 +556,7 @@ class SiteRefreshCDP(_PluginBase):
             return False
 
         try:
-            page.wait_for_load_state("load")
+            self.__wait_load(page)
         except Exception:
             pass
         logger.info(f"站点{site_name}人机验证已通过，共{round_no}轮，当前地址：{page.url}")
