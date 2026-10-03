@@ -28,7 +28,7 @@ class SiteRefreshCDP(_PluginBase):
     # 插件图标
     plugin_icon = "Chrome_A.png"
     # 插件版本
-    plugin_version = "1.9"
+    plugin_version = "1.10"
     # 插件作者
     plugin_author = "al"
     # 作者主页
@@ -238,6 +238,11 @@ class SiteRefreshCDP(_PluginBase):
     LOGIN_COOKIES = ("c_secure_uid", "c_secure_pass", "uid", "pass")
     # 标签页被中途关闭时，最多尝试的总次数（含首次）
     CLOSED_RETRY = 3
+    # 页面跳转遇到瞬时网络错误时的最多尝试次数（含首次）
+    NET_RETRY = 3
+    NET_ERRORS = ("ERR_CONNECTION_CLOSED", "ERR_CONNECTION_RESET", "ERR_CONNECTION_TIMED_OUT",
+                  "ERR_TIMED_OUT", "ERR_EMPTY_RESPONSE", "ERR_NETWORK_CHANGED",
+                  "ERR_CONNECTION_REFUSED", "ERR_SSL_PROTOCOL_ERROR")
 
     def __pick_context(self, browser, site) -> Tuple[Any, bool]:
         """
@@ -485,10 +490,27 @@ class SiteRefreshCDP(_PluginBase):
         打开页面并等待加载完成，遇到Cloudflare人机验证时原地等待/刷新直到通过
         :return: 页面是否已是正常内容（非验证页）
         """
-        page.goto(url)
+        self.__goto(page=page, url=url, site_name=site_name)
         # 等到load而非domcontentloaded，否则验证码图片可能还没下载完
         page.wait_for_load_state("load")
         return self.__pass_challenge(page=page, site_name=site_name)
+
+    def __goto(self, page, url: str, site_name: str):
+        """
+        跳转页面，连接被断开/重置/超时等瞬时网络错误时等几秒重试
+        """
+        for attempt in range(1, self.NET_RETRY + 1):
+            try:
+                page.goto(url)
+                return
+            except Exception as e:
+                text = str(e)
+                transient = any(key in text for key in self.NET_ERRORS)
+                if not transient or attempt >= self.NET_RETRY:
+                    raise
+                logger.warn(f"站点{site_name}访问{url}失败（{text.splitlines()[0]}），"
+                            f"{attempt * 5}秒后重试（第{attempt + 1}次）")
+                time.sleep(attempt * 5)
 
     def __pass_challenge(self, page, site_name: str) -> bool:
         """
